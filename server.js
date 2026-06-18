@@ -37,7 +37,40 @@ function rateLimit(req, res, next) {
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use('/api/claude', rateLimit);
+// ============ AUTENTICAÇÃO (valida token do Supabase) ============
+// Garante que só usuários logados de verdade usem a IA (protege os créditos da Anthropic).
+async function requireAuth(req, res, next) {
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: 'Acesso negado: faça login para usar a IA.' });
+  }
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ error: 'Validação de login não configurada no servidor.' });
+  }
+  try {
+    const r = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        'apikey': process.env.SUPABASE_SERVICE_KEY,
+        'Authorization': `Bearer ${token}`
+      }
+    });
+    if (!r.ok) {
+      return res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
+    }
+    const user = await r.json();
+    if (!user || !user.id) {
+      return res.status(401).json({ error: 'Sessão inválida.' });
+    }
+    req.user = user; // disponível para uso futuro (ex: cobrança por uso)
+    next();
+  } catch (e) {
+    console.error('Erro ao validar sessão:', e);
+    return res.status(401).json({ error: 'Falha ao validar sua sessão.' });
+  }
+}
+
+app.use('/api/claude', rateLimit, requireAuth);
 
 // ============ ROTA CLAUDE ============
 app.post('/api/claude', async (req, res) => {
