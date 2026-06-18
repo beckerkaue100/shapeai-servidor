@@ -87,43 +87,8 @@ app.post('/api/assinatura/criar', async (req, res) => {
   }
 
   try {
-    // Busca ou cria o plano de assinatura no MP
-    let plano_id = process.env.MP_PLANO_ID;
-
-    if (!plano_id) {
-      // Cria o plano se ainda não existir
-      const resPlano = await fetch('https://api.mercadopago.com/preapproval_plan', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`
-        },
-        body: JSON.stringify({
-          reason: 'ShapeAI — Treino & Nutrição com IA',
-          auto_recurring: {
-            frequency: 1,
-            frequency_type: 'months',
-            transaction_amount: 29.90,
-            currency_id: 'BRL'
-          },
-          payment_methods_allowed: {
-            payment_types: [{ id: 'credit_card' }, { id: 'debit_card' }],
-            payment_methods: [{ id: 'pix' }]
-          },
-          back_url: 'https://app-two-sigma-57.vercel.app'
-        })
-      });
-      const dadosPlano = await resPlano.json();
-      if (dadosPlano.id) {
-        plano_id = dadosPlano.id;
-        console.log('Plano MP criado:', plano_id);
-      } else {
-        console.error('Erro ao criar plano MP:', dadosPlano);
-        return res.status(500).json({ error: 'Erro ao criar plano de assinatura.' });
-      }
-    }
-
-    // Cria a assinatura para o usuário
+    // Cria a assinatura (preapproval) com status pending → retorna init_point
+    // para o usuário inserir o cartão no checkout hospedado do Mercado Pago.
     const resAssinatura = await fetch('https://api.mercadopago.com/preapproval', {
       method: 'POST',
       headers: {
@@ -131,8 +96,8 @@ app.post('/api/assinatura/criar', async (req, res) => {
         'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`
       },
       body: JSON.stringify({
-        preapproval_plan_id: plano_id,
         reason: 'ShapeAI — Treino & Nutrição com IA',
+        external_reference: user_id,
         payer_email: email,
         auto_recurring: {
           frequency: 1,
@@ -141,7 +106,7 @@ app.post('/api/assinatura/criar', async (req, res) => {
           currency_id: 'BRL'
         },
         back_url: 'https://app-two-sigma-57.vercel.app',
-        external_reference: user_id
+        status: 'pending'
       })
     });
 
