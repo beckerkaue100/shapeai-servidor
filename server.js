@@ -219,14 +219,68 @@ app.post('/api/webhook/mp', async (req, res) => {
 
     console.log(`Assinatura atualizada: user=${user_id} status=${status} ativa=${ativa}`);
 
+    // ===== RECOMPENSA DE INDICAÇÃO =====
+    // Se este usuário foi INDICADO por alguém e acabou de assinar, dá +30 dias grátis a quem indicou.
+    if (ativa) {
+      await recompensarIndicacao(user_id);
+    }
+
   } catch (erro) {
     console.error('Erro no webhook:', erro);
   }
 });
 
+const SB_HEADERS = () => ({
+  'Content-Type': 'application/json',
+  'apikey': process.env.SUPABASE_SERVICE_KEY,
+  'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`
+});
+
+async function recompensarIndicacao(referred_id) {
+  try {
+    // Busca indicação ainda não recompensada para este indicado
+    const r = await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?referred_id=eq.${referred_id}&recompensado=eq.false&select=id,referrer_id`, {
+      headers: SB_HEADERS()
+    });
+    const lista = await r.json();
+    if (!Array.isArray(lista) || !lista.length) return;
+
+    const indic = lista[0];
+    const referrer_id = indic.referrer_id;
+
+    // Lê a assinatura atual do indicador para estender a validade
+    const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${referrer_id}&select=validade`, {
+      headers: SB_HEADERS()
+    });
+    const asg = await ra.json();
+    const base = (Array.isArray(asg) && asg[0] && asg[0].validade && new Date(asg[0].validade) > new Date())
+      ? new Date(asg[0].validade)
+      : new Date();
+    const novaValidade = new Date(base.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    // Concede +30 dias ao indicador (mantém ativo)
+    await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS(), 'Prefer': 'resolution=merge-duplicates' },
+      body: JSON.stringify({ user_id: referrer_id, ativa: true, validade: novaValidade, status_mp: 'recompensa_indicacao', updated_at: new Date().toISOString() })
+    });
+
+    // Marca a indicação como recompensada e que o indicado assinou
+    await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
+      method: 'PATCH',
+      headers: SB_HEADERS(),
+      body: JSON.stringify({ assinou: true, recompensado: true })
+    });
+
+    console.log(`Recompensa de indicação: referrer=${referrer_id} ganhou +30 dias (até ${novaValidade})`);
+  } catch (e) {
+    console.error('Erro ao recompensar indicação:', e);
+  }
+}
+
 // ============ ROTA DE TESTE ============
 app.get('/', (req, res) => {
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.2' });
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.3' });
 });
 
 app.listen(PORT, () => {
