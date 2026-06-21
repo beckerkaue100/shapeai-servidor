@@ -99,6 +99,16 @@ app.post('/api/claude', async (req, res) => {
     });
 
     const dados = await resposta.json();
+
+    // Se a Anthropic devolveu erro, repassa o status e a mensagem real (não mascarar como 200)
+    if (!resposta.ok || dados.type === 'error') {
+      console.error('Erro da Anthropic:', resposta.status, JSON.stringify(dados));
+      return res.status(resposta.status || 502).json({
+        error: dados.error?.message || 'Erro ao processar com a IA.',
+        anthropic: dados.error || dados
+      });
+    }
+
     res.json(dados);
 
   } catch (erro) {
