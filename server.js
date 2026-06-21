@@ -78,7 +78,7 @@ app.post('/api/claude', async (req, res) => {
     return res.status(500).json({ error: 'API Key não configurada no servidor.' });
   }
 
-  const modelosPermitidos = ['claude-sonnet-4-20250514', 'claude-haiku-4-20250514', 'claude-opus-4-20250514'];
+  const modelosPermitidos = ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-opus-4-8'];
   if (req.body.model && !modelosPermitidos.includes(req.body.model)) {
     return res.status(400).json({ error: 'Modelo não autorizado.' });
   }
