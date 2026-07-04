@@ -278,9 +278,33 @@ async function recompensarIndicacao(referred_id) {
   }
 }
 
+// ============ EXCLUIR CONTA (LGPD) ============
+// Apaga todos os dados do usuário e o próprio login. Exige token válido.
+app.post('/api/conta/excluir', requireAuth, async (req, res) => {
+  const uid = req.user && req.user.id;
+  if (!uid) return res.status(400).json({ error: 'Usuário inválido.' });
+  const tabelas = ['meta_macros','meta_agua','alimentos_dia','agua_log','peso_log','historico','treino_atual','cargas_log','dias_ativos','perfil','cardapio_atual','assinaturas','medidas'];
+  try {
+    // apaga linhas de cada tabela (best-effort, ignora tabela inexistente)
+    for (const t of tabelas) {
+      try { await fetch(`${process.env.SUPABASE_URL}/rest/v1/${t}?user_id=eq.${uid}`, { method: 'DELETE', headers: SB_HEADERS() }); } catch (_) {}
+    }
+    // indicações: apaga as que o usuário fez e as que recebeu
+    try { await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?referrer_id=eq.${uid}`, { method: 'DELETE', headers: SB_HEADERS() }); } catch (_) {}
+    try { await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?referred_id=eq.${uid}`, { method: 'DELETE', headers: SB_HEADERS() }); } catch (_) {}
+    // por fim, apaga o usuário do Auth (login)
+    const del = await fetch(`${process.env.SUPABASE_URL}/auth/v1/admin/users/${uid}`, { method: 'DELETE', headers: SB_HEADERS() });
+    if (!del.ok) { const e = await del.text(); console.error('Erro ao apagar auth user:', e); }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Erro ao excluir conta:', e);
+    res.status(500).json({ error: 'Erro ao excluir a conta.' });
+  }
+});
+
 // ============ ROTA DE TESTE ============
 app.get('/', (req, res) => {
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.3' });
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.4' });
 });
 
 app.listen(PORT, () => {
