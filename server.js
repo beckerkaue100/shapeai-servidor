@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -35,7 +36,16 @@ function rateLimit(req, res, next) {
   next();
 }
 
-app.use(cors());
+// CORS: só o app oficial pode chamar a API pelo navegador.
+// Para trocar de domínio no futuro, defina ALLOWED_ORIGINS no Railway (separado por vírgula).
+const ORIGENS_PERMITIDAS = (process.env.ALLOWED_ORIGINS || 'https://app-two-sigma-57.vercel.app').split(',').map(o => o.trim());
+app.use(cors({
+  origin: (origin, cb) => {
+    // Sem origin = requisição servidor-a-servidor (ex.: webhook do Mercado Pago) → permite
+    if (!origin || ORIGENS_PERMITIDAS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  }
+}));
 app.use(express.json({ limit: '10mb' }));
 // ============ AUTENTICAÇÃO (valida token do Supabase) ============
 // Garante que só usuários logados de verdade usem a IA (protege os créditos da Anthropic).
@@ -118,11 +128,13 @@ app.post('/api/claude', async (req, res) => {
 });
 
 // ============ MERCADO PAGO — CRIAR ASSINATURA ============
-app.post('/api/assinatura/criar', async (req, res) => {
-  const { user_id, email, nome } = req.body;
+app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
+  // Identidade vem da sessão validada (não confiamos no corpo da requisição)
+  const user_id = req.user.id;
+  const email = req.user.email;
 
   if (!user_id || !email) {
-    return res.status(400).json({ error: 'user_id e email são obrigatórios.' });
+    return res.status(400).json({ error: 'Sessão sem e-mail válido.' });
   }
 
   if (!process.env.MP_ACCESS_TOKEN) {
@@ -172,7 +184,33 @@ app.post('/api/assinatura/criar', async (req, res) => {
 });
 
 // ============ MERCADO PAGO — WEBHOOK (notificação de pagamento) ============
+// Valida a assinatura HMAC que o Mercado Pago envia (header x-signature).
+// Só bloqueia se MP_WEBHOOK_SECRET estiver configurado no Railway.
+function webhookAssinaturaValida(req) {
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  if (!secret) return true; // sem secret configurado, não bloqueia (mas loga aviso)
+  try {
+    const sig = req.headers['x-signature'] || '';
+    const partes = Object.fromEntries(sig.split(',').map(p => p.trim().split('=')));
+    const ts = partes.ts, v1 = partes.v1;
+    if (!ts || !v1) return false;
+    const dataId = String(req.query['data.id'] || req.body?.data?.id || '').toLowerCase();
+    const requestId = req.headers['x-request-id'] || '';
+    const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+    const esperado = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(esperado), Buffer.from(v1));
+  } catch (e) {
+    return false;
+  }
+}
+
 app.post('/api/webhook/mp', async (req, res) => {
+  if (!process.env.MP_WEBHOOK_SECRET) console.warn('MP_WEBHOOK_SECRET não configurado — webhook sem validação de assinatura.');
+  if (!webhookAssinaturaValida(req)) {
+    console.warn('Webhook MP com assinatura inválida — ignorado.');
+    return res.sendStatus(401);
+  }
+
   // Responde 200 imediatamente para o MP não retentar
   res.sendStatus(200);
 
@@ -280,7 +318,7 @@ async function recompensarIndicacao(referred_id) {
 
 // ============ EXCLUIR CONTA (LGPD) ============
 // Apaga todos os dados do usuário e o próprio login. Exige token válido.
-app.post('/api/conta/excluir', requireAuth, async (req, res) => {
+app.post('/api/conta/excluir', rateLimit, requireAuth, async (req, res) => {
   const uid = req.user && req.user.id;
   if (!uid) return res.status(400).json({ error: 'Usuário inválido.' });
   const tabelas = ['meta_macros','meta_agua','alimentos_dia','agua_log','peso_log','historico','treino_atual','cargas_log','dias_ativos','perfil','cardapio_atual','assinaturas','medidas'];
@@ -292,6 +330,20 @@ app.post('/api/conta/excluir', requireAuth, async (req, res) => {
     // indicações: apaga as que o usuário fez e as que recebeu
     try { await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?referrer_id=eq.${uid}`, { method: 'DELETE', headers: SB_HEADERS() }); } catch (_) {}
     try { await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?referred_id=eq.${uid}`, { method: 'DELETE', headers: SB_HEADERS() }); } catch (_) {}
+    // fotos de progresso no Storage (LGPD: apagar tudo que é do usuário)
+    try {
+      const rl = await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/list/progresso`, {
+        method: 'POST', headers: SB_HEADERS(),
+        body: JSON.stringify({ prefix: uid, limit: 1000 })
+      });
+      const arquivos = await rl.json();
+      if (Array.isArray(arquivos) && arquivos.length) {
+        await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/progresso`, {
+          method: 'DELETE', headers: SB_HEADERS(),
+          body: JSON.stringify({ prefixes: arquivos.map(f => `${uid}/${f.name}`) })
+        });
+      }
+    } catch (_) {}
     // por fim, apaga o usuário do Auth (login)
     const del = await fetch(`${process.env.SUPABASE_URL}/auth/v1/admin/users/${uid}`, { method: 'DELETE', headers: SB_HEADERS() });
     if (!del.ok) { const e = await del.text(); console.error('Erro ao apagar auth user:', e); }
@@ -304,7 +356,7 @@ app.post('/api/conta/excluir', requireAuth, async (req, res) => {
 
 // ============ ROTA DE TESTE ============
 app.get('/', (req, res) => {
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.4' });
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.5' });
 });
 
 app.listen(PORT, () => {
