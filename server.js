@@ -127,6 +127,50 @@ app.post('/api/claude', async (req, res) => {
   }
 });
 
+// ============ PLANOS ============
+// O preço NUNCA vem do navegador — é definido aqui no servidor.
+const PLANOS = {
+  mensal: {
+    id: 'mensal',
+    reason: 'ShapeAI — Mensal',
+    valor: 29.90,
+    frequency: 1,
+    frequency_type: 'months',
+    fundador: false
+  },
+  anual_fundador: {
+    id: 'anual_fundador',
+    reason: 'ShapeAI — Anual (Preço de Fundador)',
+    valor: 149.00,
+    frequency: 12,
+    frequency_type: 'months',
+    fundador: true
+  }
+};
+const VAGAS_FUNDADOR = 100;
+
+// Quantas vagas de fundador já foram ocupadas (conta assinaturas fundador confirmadas)
+async function contarFundadores() {
+  const r = await fetch(
+    `${process.env.SUPABASE_URL}/rest/v1/assinaturas?fundador=eq.true&ativa=eq.true&select=user_id`,
+    { headers: { ...SB_HEADERS(), 'Prefer': 'count=exact' } }
+  );
+  const lista = await r.json();
+  return Array.isArray(lista) ? lista.length : 0;
+}
+
+// O app consulta isso para mostrar "restam X de 100 vagas" (contador REAL — exigência do CDC)
+app.get('/api/fundador/vagas', async (req, res) => {
+  try {
+    const ocupadas = await contarFundadores();
+    const restantes = Math.max(0, VAGAS_FUNDADOR - ocupadas);
+    res.json({ total: VAGAS_FUNDADOR, ocupadas, restantes, aberto: restantes > 0 });
+  } catch (e) {
+    console.error('Erro ao contar vagas de fundador:', e);
+    res.json({ total: VAGAS_FUNDADOR, ocupadas: 0, restantes: VAGAS_FUNDADOR, aberto: true });
+  }
+});
+
 // ============ MERCADO PAGO — CRIAR ASSINATURA ============
 app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
   // Identidade vem da sessão validada (não confiamos no corpo da requisição)
@@ -141,7 +185,20 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'Mercado Pago não configurado.' });
   }
 
+  const plano = PLANOS[req.body.plano] || PLANOS.mensal;
+
   try {
+    // Vaga de fundador: se acabou, cai no mensal (nunca vende mais de 100 — a escassez é real)
+    if (plano.fundador) {
+      const ocupadas = await contarFundadores();
+      if (ocupadas >= VAGAS_FUNDADOR) {
+        return res.status(409).json({
+          error: 'As 100 vagas de fundador acabaram. Escolha o plano mensal.',
+          vagas_esgotadas: true
+        });
+      }
+    }
+
     // Cria a assinatura (preapproval) com status pending → retorna init_point
     // para o usuário inserir o cartão no checkout hospedado do Mercado Pago.
     const resAssinatura = await fetch('https://api.mercadopago.com/preapproval', {
@@ -151,13 +208,13 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
         'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`
       },
       body: JSON.stringify({
-        reason: 'ShapeAI — Treino & Nutrição com IA',
-        external_reference: user_id,
+        reason: plano.reason,
+        external_reference: `${user_id}|${plano.id}`,
         payer_email: email,
         auto_recurring: {
-          frequency: 1,
-          frequency_type: 'months',
-          transaction_amount: 29.90,
+          frequency: plano.frequency,
+          frequency_type: plano.frequency_type,
+          transaction_amount: plano.valor,
           currency_id: 'BRL'
         },
         back_url: 'https://app-two-sigma-57.vercel.app',
@@ -170,7 +227,8 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
     if (dadosAssinatura.init_point) {
       res.json({
         checkout_url: dadosAssinatura.init_point,
-        assinatura_id: dadosAssinatura.id
+        assinatura_id: dadosAssinatura.id,
+        plano: plano.id
       });
     } else {
       console.error('Erro MP criar assinatura:', dadosAssinatura);
@@ -226,16 +284,29 @@ app.post('/api/webhook/mp', async (req, res) => {
     });
     const assinatura = await resMP.json();
 
-    const user_id = assinatura.external_reference;
+    // external_reference agora é "user_id|plano" (formato antigo, só user_id, ainda funciona)
+    const ref = String(assinatura.external_reference || '');
+    const [user_id, planoRef] = ref.split('|');
     const status = assinatura.status; // authorized, paused, cancelled
 
     if (!user_id) return;
 
-    // Atualiza status no Supabase via REST API
+    const plano = PLANOS[planoRef] || PLANOS.mensal;
     const ativa = status === 'authorized';
+
+    // Validade acompanha o plano: mensal = +35 dias · anual = +1 ano e 5 dias (folga pra renovação)
+    const diasValidade = plano.frequency_type === 'months' && plano.frequency >= 12 ? 370 : 35;
     const validade = ativa
-      ? new Date(Date.now() + 35 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] // +35 dias
+      ? new Date(Date.now() + diasValidade * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
       : null;
+
+    // Vaga de fundador só é marcada se AINDA houver vaga no momento da confirmação
+    let ehFundador = false;
+    if (ativa && plano.fundador) {
+      const ocupadas = await contarFundadores();
+      ehFundador = ocupadas < VAGAS_FUNDADOR;
+      if (!ehFundador) console.warn(`Vagas de fundador esgotadas — user=${user_id} pagou anual mas entra sem selo.`);
+    }
 
     await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas`, {
       method: 'POST',
@@ -249,18 +320,24 @@ app.post('/api/webhook/mp', async (req, res) => {
         user_id,
         ativa,
         validade,
+        plano: plano.id,
+        fundador: ehFundador,
+        preco_pago: ativa ? plano.valor : null,
         mp_assinatura_id: data.id,
         status_mp: status,
         updated_at: new Date().toISOString()
       })
     });
 
-    console.log(`Assinatura atualizada: user=${user_id} status=${status} ativa=${ativa}`);
+    console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} fundador=${ehFundador}`);
 
     // ===== RECOMPENSA DE INDICAÇÃO =====
     // Se este usuário foi INDICADO por alguém e acabou de assinar, dá +30 dias grátis a quem indicou.
     if (ativa) {
       await recompensarIndicacao(user_id);
+    } else {
+      // Cancelou/pausou: se foi indicado e o bônus é recente, estorna (antifraude do arrependimento)
+      await estornarIndicacaoSeRecente(user_id);
     }
 
   } catch (erro) {
@@ -274,6 +351,9 @@ const SB_HEADERS = () => ({
   'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`
 });
 
+// ============ INDICAÇÃO — RECOMPENSA COM ANTIFRAUDE ============
+const MAX_RECOMPENSAS_INDICACAO = 10; // teto por indicador (300 dias) — trava fraude em escala
+
 async function recompensarIndicacao(referred_id) {
   try {
     // Busca indicação ainda não recompensada para este indicado
@@ -285,6 +365,31 @@ async function recompensarIndicacao(referred_id) {
 
     const indic = lista[0];
     const referrer_id = indic.referrer_id;
+
+    // ANTIFRAUDE 1 — auto-indicação: ninguém indica a si mesmo
+    if (!referrer_id || referrer_id === referred_id) {
+      console.warn(`Antifraude: auto-indicação bloqueada (user=${referred_id}).`);
+      await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
+        method: 'PATCH', headers: SB_HEADERS(),
+        body: JSON.stringify({ assinou: true, recompensado: true, estornado: true })
+      });
+      return;
+    }
+
+    // ANTIFRAUDE 2 — teto de recompensas por indicador (impede fábrica de contas falsas)
+    const rc = await fetch(
+      `${process.env.SUPABASE_URL}/rest/v1/indicacoes?referrer_id=eq.${referrer_id}&recompensado=eq.true&estornado=eq.false&select=id`,
+      { headers: SB_HEADERS() }
+    );
+    const jaGanhou = await rc.json();
+    if (Array.isArray(jaGanhou) && jaGanhou.length >= MAX_RECOMPENSAS_INDICACAO) {
+      console.warn(`Antifraude: teto de ${MAX_RECOMPENSAS_INDICACAO} recompensas atingido (referrer=${referrer_id}).`);
+      await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
+        method: 'PATCH', headers: SB_HEADERS(),
+        body: JSON.stringify({ assinou: true, recompensado: true, estornado: true })
+      });
+      return;
+    }
 
     // Lê a assinatura atual do indicador para estender a validade
     const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${referrer_id}&select=validade`, {
@@ -307,12 +412,58 @@ async function recompensarIndicacao(referred_id) {
     await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
       method: 'PATCH',
       headers: SB_HEADERS(),
-      body: JSON.stringify({ assinou: true, recompensado: true })
+      body: JSON.stringify({ assinou: true, recompensado: true, recompensado_em: new Date().toISOString() })
     });
 
     console.log(`Recompensa de indicação: referrer=${referrer_id} ganhou +30 dias (até ${novaValidade})`);
   } catch (e) {
     console.error('Erro ao recompensar indicação:', e);
+  }
+}
+
+// ANTIFRAUDE 3 — se o INDICADO cancelar/pedir reembolso logo (≤35 dias), estorna os 30 dias do indicador.
+// Fecha o golpe: assinar, gerar o bônus e cancelar dentro do prazo de arrependimento (7 dias, CDC).
+async function estornarIndicacaoSeRecente(referred_id) {
+  try {
+    const r = await fetch(
+      `${process.env.SUPABASE_URL}/rest/v1/indicacoes?referred_id=eq.${referred_id}&recompensado=eq.true&estornado=eq.false&select=id,referrer_id,recompensado_em`,
+      { headers: SB_HEADERS() }
+    );
+    const lista = await r.json();
+    if (!Array.isArray(lista) || !lista.length) return;
+
+    const indic = lista[0];
+    const quando = indic.recompensado_em ? new Date(indic.recompensado_em) : null;
+    if (!quando) return;
+    const dias = (Date.now() - quando.getTime()) / (24 * 60 * 60 * 1000);
+    if (dias > 35) return; // já consolidou — o indicado pagou de verdade, o bônus é legítimo
+
+    // Tira os 30 dias que haviam sido concedidos ao indicador
+    const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${indic.referrer_id}&select=validade`, {
+      headers: SB_HEADERS()
+    });
+    const asg = await ra.json();
+    if (Array.isArray(asg) && asg[0] && asg[0].validade) {
+      const nova = new Date(new Date(asg[0].validade).getTime() - 30 * 24 * 60 * 60 * 1000);
+      const aindaVale = nova > new Date();
+      await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${indic.referrer_id}`, {
+        method: 'PATCH', headers: SB_HEADERS(),
+        body: JSON.stringify({
+          validade: nova.toISOString().split('T')[0],
+          ativa: aindaVale,
+          updated_at: new Date().toISOString()
+        })
+      });
+    }
+
+    await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
+      method: 'PATCH', headers: SB_HEADERS(),
+      body: JSON.stringify({ estornado: true })
+    });
+
+    console.warn(`Antifraude: bônus estornado — indicado ${referred_id} cancelou em ${Math.round(dias)} dias (referrer=${indic.referrer_id}).`);
+  } catch (e) {
+    console.error('Erro ao estornar indicação:', e);
   }
 }
 
@@ -356,7 +507,7 @@ app.post('/api/conta/excluir', rateLimit, requireAuth, async (req, res) => {
 
 // ============ ROTA DE TESTE ============
 app.get('/', (req, res) => {
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.5' });
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.6' });
 });
 
 app.listen(PORT, () => {
