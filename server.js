@@ -83,12 +83,15 @@ async function requireAuth(req, res, next) {
 app.use('/api/claude', rateLimit, requireAuth);
 
 // ============ ROTA CLAUDE ============
+// No escopo do módulo pra também aparecer no endpoint de status (serve pra conferir de fora
+// se o deploy do Railway já subiu). Só o servidor decide quais modelos podem ser chamados.
+const modelosPermitidos = ['claude-sonnet-5', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-opus-4-8'];
+
 app.post('/api/claude', async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'API Key não configurada no servidor.' });
   }
 
-  const modelosPermitidos = ['claude-sonnet-5', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-opus-4-8'];
   if (req.body.model && !modelosPermitidos.includes(req.body.model)) {
     return res.status(400).json({ error: 'Modelo não autorizado.' });
   }
@@ -507,7 +510,9 @@ app.post('/api/conta/excluir', rateLimit, requireAuth, async (req, res) => {
 
 // ============ ROTA DE TESTE ============
 app.get('/', (req, res) => {
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.6' });
+  // modelos vai na resposta de propósito: é como dá pra conferir, de fora, se o deploy
+  // do Railway já pegou a versão nova (a lista muda quando liberamos um modelo novo)
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.7', modelos: modelosPermitidos });
 });
 
 app.listen(PORT, () => {
