@@ -96,8 +96,11 @@ app.post('/api/claude', async (req, res) => {
     return res.status(400).json({ error: 'Modelo não autorizado.' });
   }
 
-  if (req.body.max_tokens && req.body.max_tokens > 2000) {
-    req.body.max_tokens = 2000;
+  // 4000: a análise de foto raciocina antes de montar o JSON e, em prato com muitos itens,
+  // 2000 cortava a resposta no meio (JSON inválido). max_tokens é TETO, não custo fixo —
+  // só é cobrado o que o modelo realmente gerar.
+  if (req.body.max_tokens && req.body.max_tokens > 4000) {
+    req.body.max_tokens = 4000;
   }
 
   try {
@@ -512,7 +515,7 @@ app.post('/api/conta/excluir', rateLimit, requireAuth, async (req, res) => {
 app.get('/', (req, res) => {
   // modelos vai na resposta de propósito: é como dá pra conferir, de fora, se o deploy
   // do Railway já pegou a versão nova (a lista muda quando liberamos um modelo novo)
-  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.7', modelos: modelosPermitidos });
+  res.json({ status: 'ShapeAI servidor rodando!', versao: '1.8', modelos: modelosPermitidos });
 });
 
 app.listen(PORT, () => {
