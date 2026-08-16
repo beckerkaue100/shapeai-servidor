@@ -280,11 +280,28 @@ app.post('/api/webhook/mp', async (req, res) => {
   const { type, data } = req.body;
   console.log('Webhook MP recebido:', type, data?.id);
 
-  if (type !== 'preapproval' || !data?.id) return;
+  // O MP avisa duas coisas diferentes, com nomes que variam conforme a integração:
+  //   assinatura mudou de status  -> preapproval / subscription_preapproval
+  //   cobrança recorrente rodou   -> authorized_payment / subscription_authorized_payment
+  // Antes só a primeira era tratada, então RENOVAÇÃO NÃO ESTENDIA A VALIDADE.
+  const ehAssinatura = type === 'preapproval' || type === 'subscription_preapproval';
+  const ehCobranca   = type === 'authorized_payment' || type === 'subscription_authorized_payment';
+  if ((!ehAssinatura && !ehCobranca) || !data?.id) return;
 
   try {
-    // Busca detalhes da assinatura no MP
-    const resMP = await fetch(`https://api.mercadopago.com/preapproval/${data.id}`, {
+    // Na cobrança, o id é do pagamento — o da assinatura vem dentro dele.
+    let preapprovalId = data.id;
+    if (ehCobranca) {
+      const rPag = await fetch(`https://api.mercadopago.com/authorized_payments/${data.id}`, {
+        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+      });
+      const pagamento = await rPag.json();
+      preapprovalId = pagamento.preapproval_id;
+      if (!preapprovalId) { console.warn('Cobrança sem preapproval_id:', data.id); return; }
+    }
+
+    // Busca detalhes da assinatura no MP (fonte da verdade nos dois casos)
+    const resMP = await fetch(`https://api.mercadopago.com/preapproval/${preapprovalId}`, {
       headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
     });
     const assinatura = await resMP.json();
@@ -299,11 +316,17 @@ app.post('/api/webhook/mp', async (req, res) => {
     const plano = PLANOS[planoRef] || PLANOS.mensal;
     const ativa = status === 'authorized';
 
-    // Validade acompanha o plano: mensal = +35 dias · anual = +1 ano e 5 dias (folga pra renovação)
+    // Validade: quem sabe quando a próxima cobrança cai é o Mercado Pago, não eu.
+    // Usar next_payment_date (com folga) faz a renovação estender sozinha e evita
+    // contar dias na mão. Se o MP não mandar a data, cai no cálculo por plano.
+    const FOLGA_DIAS = 5;   // margem pra falha de cobrança e retentativa do MP
     const diasValidade = plano.frequency_type === 'months' && plano.frequency >= 12 ? 370 : 35;
-    const validade = ativa
-      ? new Date(Date.now() + diasValidade * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
-      : null;
+    let validade = null;
+    if (ativa) {
+      const prox = assinatura.next_payment_date ? new Date(assinatura.next_payment_date) : null;
+      const base = (prox && !isNaN(prox)) ? prox.getTime() : Date.now() + diasValidade * 86400000;
+      validade = new Date(base + FOLGA_DIAS * 86400000).toISOString().split('T')[0];
+    }
 
     // A coluna 'fundador' agora quer dizer: entrou pela oferta de lançamento e tem
     // o preço travado na renovação. Não há mais contagem de vagas.
@@ -324,21 +347,25 @@ app.post('/api/webhook/mp', async (req, res) => {
         plano: plano.id,
         fundador: ehPromo,
         preco_pago: ativa ? plano.valor : null,
-        mp_assinatura_id: data.id,
+        mp_assinatura_id: preapprovalId,
         status_mp: status,
         updated_at: new Date().toISOString()
       })
     });
 
-    console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} promo=${ehPromo}`);
+    console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} promo=${ehPromo} validade=${validade} (aviso: ${type})`);
 
     // ===== RECOMPENSA DE INDICAÇÃO =====
-    // Se este usuário foi INDICADO por alguém e acabou de assinar, dá +30 dias grátis a quem indicou.
-    if (ativa) {
-      await recompensarIndicacao(user_id);
-    } else {
-      // Cancelou/pausou: se foi indicado e o bônus é recente, estorna (antifraude do arrependimento)
-      await estornarIndicacaoSeRecente(user_id);
+    // Só na mudança de status da assinatura. Numa cobrança mensal bem-sucedida nada
+    // acontece aqui: premiar de novo daria +30 dias todo mês pela mesma indicação,
+    // e estornar cancelaria o bônus de quem está pagando em dia.
+    if (ehAssinatura) {
+      if (ativa) {
+        await recompensarIndicacao(user_id);
+      } else {
+        // Cancelou/pausou: se foi indicado e o bônus é recente, estorna (antifraude do arrependimento)
+        await estornarIndicacaoSeRecente(user_id);
+      }
     }
 
   } catch (erro) {
