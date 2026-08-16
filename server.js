@@ -144,37 +144,38 @@ const PLANOS = {
     frequency_type: 'months',
     fundador: false
   },
-  anual_fundador: {
-    id: 'anual_fundador',
-    reason: 'ShapeAI — Anual (Preço de Fundador)',
+  anual_promo: {
+    id: 'anual_promo',
+    reason: 'ShapeAI — Anual (Oferta de Lançamento)',
     valor: 149.00,
     frequency: 12,
     frequency_type: 'months',
-    fundador: true
+    promo: true
   }
 };
-const VAGAS_FUNDADOR = 100;
+// Checkouts criados antes da troca de nome ainda chegam como 'anual_fundador'.
+PLANOS.anual_fundador = PLANOS.anual_promo;
 
-// Quantas vagas de fundador já foram ocupadas (conta assinaturas fundador confirmadas)
-async function contarFundadores() {
-  const r = await fetch(
-    `${process.env.SUPABASE_URL}/rest/v1/assinaturas?fundador=eq.true&ativa=eq.true&select=user_id`,
-    { headers: { ...SB_HEADERS(), 'Prefer': 'count=exact' } }
-  );
-  const lista = await r.json();
-  return Array.isArray(lista) ? lista.length : 0;
+// ============ OFERTA POR TEMPO LIMITADO ============
+// Data (YYYY-MM-DD, horário de Brasília) em que a oferta anual promocional fecha.
+// Depois dela o servidor RECUSA o plano — a escassez precisa ser real, senão é
+// só um cartaz que nunca cai. Para estender ou encerrar antes, basta mudar a
+// variável OFERTA_ATE no Railway: não precisa de deploy.
+const OFERTA_ATE = (process.env.OFERTA_ATE || '2026-09-30').trim();
+
+function hojeBR() {
+  // -03:00 — senão, entre 21h e meia-noite, o servidor já acha que é amanhã
+  return new Date(Date.now() - 3 * 3600 * 1000).toISOString().split('T')[0];
 }
+function diasAteFim() {
+  const ms = new Date(OFERTA_ATE + 'T23:59:59-03:00').getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / 86400000));
+}
+function ofertaAberta() { return hojeBR() <= OFERTA_ATE; }
 
-// O app consulta isso para mostrar "restam X de 100 vagas" (contador REAL — exigência do CDC)
-app.get('/api/fundador/vagas', async (req, res) => {
-  try {
-    const ocupadas = await contarFundadores();
-    const restantes = Math.max(0, VAGAS_FUNDADOR - ocupadas);
-    res.json({ total: VAGAS_FUNDADOR, ocupadas, restantes, aberto: restantes > 0 });
-  } catch (e) {
-    console.error('Erro ao contar vagas de fundador:', e);
-    res.json({ total: VAGAS_FUNDADOR, ocupadas: 0, restantes: VAGAS_FUNDADOR, aberto: true });
-  }
+// O app consulta isso para mostrar o prazo real da oferta (nunca um número inventado)
+app.get('/api/oferta', (req, res) => {
+  res.json({ aberta: ofertaAberta(), ate: OFERTA_ATE, dias_restantes: diasAteFim() });
 });
 
 // ============ MERCADO PAGO — CRIAR ASSINATURA ============
@@ -194,15 +195,13 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
   const plano = PLANOS[req.body.plano] || PLANOS.mensal;
 
   try {
-    // Vaga de fundador: se acabou, cai no mensal (nunca vende mais de 100 — a escassez é real)
-    if (plano.fundador) {
-      const ocupadas = await contarFundadores();
-      if (ocupadas >= VAGAS_FUNDADOR) {
-        return res.status(409).json({
-          error: 'As 100 vagas de fundador acabaram. Escolha o plano mensal.',
-          vagas_esgotadas: true
-        });
-      }
+    // Oferta vencida: recusa de verdade. Anunciar prazo e continuar vendendo depois
+    // é preço promocional falso — o mesmo problema do "de/por" que nunca existiu.
+    if (plano.promo && !ofertaAberta()) {
+      return res.status(409).json({
+        error: 'A oferta de lançamento encerrou. Escolha o plano mensal.',
+        oferta_encerrada: true
+      });
     }
 
     // Cria a assinatura (preapproval) com status pending → retorna init_point
@@ -306,13 +305,9 @@ app.post('/api/webhook/mp', async (req, res) => {
       ? new Date(Date.now() + diasValidade * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
       : null;
 
-    // Vaga de fundador só é marcada se AINDA houver vaga no momento da confirmação
-    let ehFundador = false;
-    if (ativa && plano.fundador) {
-      const ocupadas = await contarFundadores();
-      ehFundador = ocupadas < VAGAS_FUNDADOR;
-      if (!ehFundador) console.warn(`Vagas de fundador esgotadas — user=${user_id} pagou anual mas entra sem selo.`);
-    }
+    // A coluna 'fundador' agora quer dizer: entrou pela oferta de lançamento e tem
+    // o preço travado na renovação. Não há mais contagem de vagas.
+    const ehPromo = !!(ativa && plano.promo);
 
     await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas`, {
       method: 'POST',
@@ -327,7 +322,7 @@ app.post('/api/webhook/mp', async (req, res) => {
         ativa,
         validade,
         plano: plano.id,
-        fundador: ehFundador,
+        fundador: ehPromo,
         preco_pago: ativa ? plano.valor : null,
         mp_assinatura_id: data.id,
         status_mp: status,
@@ -335,7 +330,7 @@ app.post('/api/webhook/mp', async (req, res) => {
       })
     });
 
-    console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} fundador=${ehFundador}`);
+    console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} promo=${ehPromo}`);
 
     // ===== RECOMPENSA DE INDICAÇÃO =====
     // Se este usuário foi INDICADO por alguém e acabou de assinar, dá +30 dias grátis a quem indicou.
