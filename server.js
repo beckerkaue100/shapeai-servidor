@@ -247,6 +247,26 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
 });
 
 // ============ MERCADO PAGO — WEBHOOK (notificação de pagamento) ============
+// Grava/atualiza a linha de assinatura do usuário.
+// on_conflict=user_id é OBRIGATÓRIO: o `resolution=merge-duplicates` do PostgREST
+// resolve pela CHAVE PRIMÁRIA (aqui `id`), não pela única de `user_id`. Sem ele o
+// upsert vira INSERT, bate em assinaturas_user_id_key e volta 409 — e antes esse
+// 409 era engolido, então o webhook logava "atualizada" sem ter gravado nada.
+async function salvarAssinatura(dados) {
+  const r = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?on_conflict=user_id`, {
+    method: 'POST',
+    headers: { ...SB_HEADERS(), 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+    body: JSON.stringify(dados)
+  });
+  if (!r.ok) {
+    const detalhe = await r.text().catch(() => '');
+    // Dinheiro entrou e o acesso não foi liberado: isso NÃO pode passar batido.
+    console.error(`FALHA AO GRAVAR ASSINATURA user=${dados.user_id} http=${r.status} ${detalhe}`);
+    return false;
+  }
+  return true;
+}
+
 // Valida a assinatura HMAC que o Mercado Pago envia (header x-signature).
 // Só bloqueia se MP_WEBHOOK_SECRET estiver configurado no Railway.
 function webhookAssinaturaValida(req) {
@@ -332,26 +352,18 @@ app.post('/api/webhook/mp', async (req, res) => {
     // o preço travado na renovação. Não há mais contagem de vagas.
     const ehPromo = !!(ativa && plano.promo);
 
-    await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': process.env.SUPABASE_SERVICE_KEY,
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-        'Prefer': 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify({
-        user_id,
-        ativa,
-        validade,
-        plano: plano.id,
-        fundador: ehPromo,
-        preco_pago: ativa ? plano.valor : null,
-        mp_assinatura_id: preapprovalId,
-        status_mp: status,
-        updated_at: new Date().toISOString()
-      })
+    const gravou = await salvarAssinatura({
+      user_id,
+      ativa,
+      validade,
+      plano: plano.id,
+      fundador: ehPromo,
+      preco_pago: ativa ? plano.valor : null,
+      mp_assinatura_id: preapprovalId,
+      status_mp: status,
+      updated_at: new Date().toISOString()
     });
+    if (!gravou) return;   // não segue pro bônus de indicação se o acesso não foi gravado
 
     console.log(`Assinatura atualizada: user=${user_id} plano=${plano.id} status=${status} ativa=${ativa} promo=${ehPromo} validade=${validade} (aviso: ${type})`);
 
@@ -430,11 +442,7 @@ async function recompensarIndicacao(referred_id) {
     const novaValidade = new Date(base.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     // Concede +30 dias ao indicador (mantém ativo)
-    await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas`, {
-      method: 'POST',
-      headers: { ...SB_HEADERS(), 'Prefer': 'resolution=merge-duplicates' },
-      body: JSON.stringify({ user_id: referrer_id, ativa: true, validade: novaValidade, status_mp: 'recompensa_indicacao', updated_at: new Date().toISOString() })
-    });
+    await salvarAssinatura({ user_id: referrer_id, ativa: true, validade: novaValidade, status_mp: 'recompensa_indicacao', updated_at: new Date().toISOString() });
 
     // Marca a indicação como recompensada e que o indicado assinou
     await fetch(`${process.env.SUPABASE_URL}/rest/v1/indicacoes?id=eq.${indic.id}`, {
