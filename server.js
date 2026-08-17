@@ -163,6 +163,15 @@ PLANOS.anual_fundador = PLANOS.anual_promo;
 // variável OFERTA_ATE no Railway: não precisa de deploy.
 const OFERTA_ATE = (process.env.OFERTA_ATE || '2026-09-30').trim();
 
+const APP_URL      = process.env.APP_URL      || 'https://app-two-sigma-57.vercel.app';
+const SERVIDOR_URL = process.env.SERVIDOR_URL || 'https://shapeai-servidor-production.up.railway.app';
+
+// Quantos dias um pagamento AVULSO libera. Recorrência quem controla é o MP;
+// aqui somos nós, então o período é exatamente o do plano.
+function diasDoPlano(plano) {
+  return (plano.frequency_type === 'months' && plano.frequency >= 12) ? 365 : 30;
+}
+
 function hojeBR() {
   // -03:00 — senão, entre 21h e meia-noite, o servidor já acha que é amanhã
   return new Date(Date.now() - 3 * 3600 * 1000).toISOString().split('T')[0];
@@ -222,7 +231,7 @@ app.post('/api/assinatura/criar', rateLimit, requireAuth, async (req, res) => {
           transaction_amount: plano.valor,
           currency_id: 'BRL'
         },
-        back_url: 'https://app-two-sigma-57.vercel.app',
+        back_url: APP_URL,
         status: 'pending'
       })
     });
@@ -267,6 +276,61 @@ async function salvarAssinatura(dados) {
   return true;
 }
 
+// ============ PAGAMENTO AVULSO (Pix, débito, saldo) ============
+// Assinatura recorrente do MP só aceita cartão de crédito — quem não tem cartão
+// não conseguia pagar de jeito nenhum. Aqui a pessoa paga UMA vez e ganha o
+// período do plano; a renovação é manual, avisada dentro do app.
+app.post('/api/pagamento/pix', rateLimit, requireAuth, async (req, res) => {
+  const user_id = req.user.id;
+  const email = req.user.email;
+  if (!user_id || !email) return res.status(400).json({ error: 'Sessão sem e-mail válido.' });
+  if (!process.env.MP_ACCESS_TOKEN) return res.status(500).json({ error: 'Mercado Pago não configurado.' });
+
+  const plano = PLANOS[req.body.plano] || PLANOS.mensal;
+
+  try {
+    if (plano.promo && !ofertaAberta()) {
+      return res.status(409).json({ error: 'A oferta de lançamento encerrou. Escolha o plano mensal.', oferta_encerrada: true });
+    }
+
+    const dias = diasDoPlano(plano);
+    const r = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` },
+      body: JSON.stringify({
+        items: [{
+          title: `${plano.reason} — ${dias} dias`,
+          quantity: 1,
+          unit_price: plano.valor,
+          currency_id: 'BRL'
+        }],
+        payer: { email },
+        // o sufixo |avulso separa do fluxo de assinatura no webhook
+        external_reference: `${user_id}|${plano.id}|avulso`,
+        payment_methods: {
+          // crédito tem o botão de assinatura, que renova sozinho — não duplicar aqui.
+          // boleto fora: 3 dias pra compensar num acesso de 30 é experiência ruim.
+          excluded_payment_types: [{ id: 'credit_card' }, { id: 'ticket' }],
+          installments: 1
+        },
+        back_urls: { success: APP_URL, pending: APP_URL, failure: APP_URL },
+        auto_return: 'approved',
+        notification_url: `${SERVIDOR_URL}/api/webhook/mp`,
+        statement_descriptor: 'SHAPEAI'
+      })
+    });
+    const pref = await r.json();
+    if (!pref.init_point) {
+      console.error('Erro MP criar preferência:', pref);
+      return res.status(500).json({ error: pref.message || 'Erro ao gerar pagamento' });
+    }
+    res.json({ checkout_url: pref.init_point, plano: plano.id, dias });
+  } catch (erro) {
+    console.error('Erro pagamento avulso:', erro);
+    res.status(500).json({ error: 'Erro ao gerar pagamento.' });
+  }
+});
+
 // Valida a assinatura HMAC que o Mercado Pago envia (header x-signature).
 // Só bloqueia se MP_WEBHOOK_SECRET estiver configurado no Railway.
 function webhookAssinaturaValida(req) {
@@ -306,7 +370,50 @@ app.post('/api/webhook/mp', async (req, res) => {
   // Antes só a primeira era tratada, então RENOVAÇÃO NÃO ESTENDIA A VALIDADE.
   const ehAssinatura = type === 'preapproval' || type === 'subscription_preapproval';
   const ehCobranca   = type === 'authorized_payment' || type === 'subscription_authorized_payment';
-  if ((!ehAssinatura && !ehCobranca) || !data?.id) return;
+  const ehAvulso     = type === 'payment';
+  if ((!ehAssinatura && !ehCobranca && !ehAvulso) || !data?.id) return;
+
+  // ---- pagamento avulso (Pix, débito, saldo): libera o período e encerra aqui ----
+  if (ehAvulso) {
+    try {
+      const rp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
+        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+      });
+      const pag = await rp.json();
+      if (pag.status !== 'approved') {
+        console.log(`Pagamento avulso ${data.id} status=${pag.status} — ainda não libera.`);
+        return;
+      }
+      const [uid, planoRef, marca] = String(pag.external_reference || '').split('|');
+      if (!uid || marca !== 'avulso') return;   // não é nosso fluxo avulso
+
+      const plano = PLANOS[planoRef] || PLANOS.mensal;
+      const dias = diasDoPlano(plano);
+
+      // Renovar antes de vencer não pode queimar os dias que sobraram:
+      // conta a partir do que for MAIOR entre hoje e a validade atual.
+      const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${uid}&select=validade`, { headers: SB_HEADERS() });
+      const atual = await ra.json();
+      const validadeAtual = Array.isArray(atual) && atual[0] ? atual[0].validade : null;
+      const hoje = hojeBR();
+      const base = (validadeAtual && validadeAtual > hoje) ? validadeAtual : hoje;
+      const validade = new Date(new Date(base + 'T12:00:00-03:00').getTime() + dias * 86400000).toISOString().split('T')[0];
+
+      const gravou = await salvarAssinatura({
+        user_id: uid, ativa: true, validade, plano: plano.id,
+        fundador: !!plano.promo, preco_pago: plano.valor,
+        mp_assinatura_id: String(data.id), status_mp: 'pago_avulso',
+        updated_at: new Date().toISOString()
+      });
+      if (!gravou) return;
+
+      console.log(`Pagamento avulso OK: user=${uid} plano=${plano.id} meio=${pag.payment_method_id} +${dias}d validade=${validade}`);
+      await recompensarIndicacao(uid);   // idempotente: só premia a 1ª vez
+    } catch (e) {
+      console.error('Erro no pagamento avulso:', e);
+    }
+    return;
+  }
 
   try {
     // Na cobrança, o id é do pagamento — o da assinatura vem dentro dele.
