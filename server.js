@@ -168,6 +168,15 @@ const SERVIDOR_URL = process.env.SERVIDOR_URL || 'https://shapeai-servidor-produ
 
 // Quantos dias um pagamento AVULSO libera. Recorrência quem controla é o MP;
 // aqui somos nós, então o período é exatamente o do plano.
+// Dias de teste grátis que a pessoa ainda não usou. Quem assina no dia 2 de um
+// teste de 14 não pode perder os 12 que sobraram: a tela de planos aparece
+// DURANTE o teste, então pagar cedo não pode sair pior do que esperar.
+function diasDeTrialSobrando(trial_fim, hoje) {
+  if (!trial_fim || trial_fim <= hoje) return 0;
+  const ms = new Date(trial_fim + 'T12:00:00-03:00') - new Date(hoje + 'T12:00:00-03:00');
+  return Math.max(0, Math.round(ms / 86400000));
+}
+
 function diasDoPlano(plano) {
   return (plano.frequency_type === 'months' && plano.frequency >= 12) ? 365 : 30;
 }
@@ -390,13 +399,18 @@ app.post('/api/webhook/mp', async (req, res) => {
       const plano = PLANOS[planoRef] || PLANOS.mensal;
       const dias = diasDoPlano(plano);
 
-      // Renovar antes de vencer não pode queimar os dias que sobraram:
-      // conta a partir do que for MAIOR entre hoje e a validade atual.
-      const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${uid}&select=validade`, { headers: SB_HEADERS() });
+      // Nada de queimar dias já garantidos. A contagem começa do que for MAIOR:
+      // hoje, a validade que já existe (renovou adiantado) ou o fim do teste
+      // grátis (assinou no meio do teste).
+      const ra = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${uid}&select=validade,trial_fim`, { headers: SB_HEADERS() });
       const atual = await ra.json();
-      const validadeAtual = Array.isArray(atual) && atual[0] ? atual[0].validade : null;
+      const linha = Array.isArray(atual) && atual[0] ? atual[0] : {};
+      const validadeAtual = linha.validade || null;
+      const trialFim = linha.trial_fim || null;
       const hoje = hojeBR();
-      const base = (validadeAtual && validadeAtual > hoje) ? validadeAtual : hoje;
+      let base = hoje;
+      if (validadeAtual && validadeAtual > base) base = validadeAtual;
+      if (trialFim && trialFim > base) base = trialFim;
       const validade = new Date(new Date(base + 'T12:00:00-03:00').getTime() + dias * 86400000).toISOString().split('T')[0];
 
       const gravou = await salvarAssinatura({
@@ -450,9 +464,17 @@ app.post('/api/webhook/mp', async (req, res) => {
     const diasValidade = plano.frequency_type === 'months' && plano.frequency >= 12 ? 370 : 35;
     let validade = null;
     if (ativa) {
+      // Assinou no meio do teste? Os dias que sobraram entram como acesso a mais.
+      // Nas renovações isso vale 0 sozinho: lá o trial_fim já ficou pra trás.
+      const rt = await fetch(`${process.env.SUPABASE_URL}/rest/v1/assinaturas?user_id=eq.${user_id}&select=trial_fim`, { headers: SB_HEADERS() });
+      const at = await rt.json().catch(() => []);
+      const trialFim = Array.isArray(at) && at[0] ? at[0].trial_fim : null;
+      const sobrando = diasDeTrialSobrando(trialFim, hojeBR());
+
       const prox = assinatura.next_payment_date ? new Date(assinatura.next_payment_date) : null;
       const base = (prox && !isNaN(prox)) ? prox.getTime() : Date.now() + diasValidade * 86400000;
-      validade = new Date(base + FOLGA_DIAS * 86400000).toISOString().split('T')[0];
+      validade = new Date(base + (FOLGA_DIAS + sobrando) * 86400000).toISOString().split('T')[0];
+      if (sobrando) console.log(`Assinou no meio do teste: +${sobrando}d de teste somados (user=${user_id})`);
     }
 
     // A coluna 'fundador' agora quer dizer: entrou pela oferta de lançamento e tem
